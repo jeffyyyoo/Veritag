@@ -9,11 +9,14 @@ use soroban_sdk::{
 };
 
 use crate::{
-    events::{BatchFrozen, BatchUnfrozen},
+    events::{
+        BatchFrozen, BatchRecalled, BatchUnfrozen, ServiceCenterRegistered, ServiceCenterRevoked,
+        ServiceCenterTierUpdated,
+    },
     merkle::{compute_leaf, hash_pair, sha256_bytes, MAX_PROOF_DEPTH},
     storage::DataKey,
     types::{
-        ClaimOutcome, RecallInfo, RegistryError, UnitStatus, VerifyStatus,
+        ClaimOutcome, RecallInfo, RegistryError, ServiceCenter, UnitStatus, VerifyStatus,
         DEFAULT_MAX_CLAIMS_PER_UNIT, SECONDS_PER_MONTH,
     },
     VeritagRegistry, VeritagRegistryClient,
@@ -1363,7 +1366,7 @@ fn test_freeze_missing_batch_and_permanent_recall() {
     );
     f.client.freeze_batch(&f.brand, &batch_id);
     f.client
-        .recall_batch(&f.brand, &batch_id, &f.hash_str("RECALL"));
+        .recall_batch(&f.brand, &batch_id, &1, &f.hash_str("RECALL"));
     assert_eq!(
         f.client.try_unfreeze_batch(&f.brand, &batch_id),
         Err(Ok(RegistryError::BatchRecalled))
@@ -1554,4 +1557,338 @@ fn test_freeze_preserves_unit_retirement_guard() {
         f.client.try_file_claim(&unit_id, &f.service_center),
         Err(Ok(RegistryError::UnitRetired))
     );
+}
+
+#[test]
+fn test_transfer_fields_preserve_legacy_records() {
+    use soroban_sdk::{Map, Symbol, TryFromVal, Val};
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("LEGACY-TRANSFER-FIELDS");
+    let (root, units) = f.build_sample_batch(1);
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &root, &1, &None, &None);
+    let batch = f.client.get_batch(&f.brand, &batch_id).unwrap();
+    let value: Val = batch.into_val(&f.env);
+    let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
+    fields.remove(Symbol::new(&f.env, "max_transfers"));
+    f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Batch(f.brand.clone(), batch_id.clone()), &fields);
+    });
+    assert_eq!(
+        f.client
+            .get_batch(&f.brand, &batch_id)
+            .unwrap()
+            .max_transfers,
+        None
+    );
+    let unit_id = f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    f.client.set_max_transfers(&f.brand, &batch_id, &Some(2));
+    assert_eq!(
+        f.client
+            .get_batch(&f.brand, &batch_id)
+            .unwrap()
+            .max_transfers,
+        Some(2)
+    );
+    let unit = f.env.as_contract(&f.contract_id, || {
+        crate::storage::get_unit(&f.env, &unit_id).unwrap()
+    });
+    let value: Val = unit.into_val(&f.env);
+    let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &value).unwrap();
+    fields.remove(Symbol::new(&f.env, "transfer_count"));
+    fields.set(
+        Symbol::new(&f.env, "last_transferred_at"),
+        17u64.into_val(&f.env),
+    );
+    f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id.clone()), &fields);
+        let unit = crate::storage::get_unit(&f.env, &unit_id).unwrap();
+        assert_eq!(unit.transfer_count, 0);
+        assert_eq!(unit.last_transferred_at, 17);
+        assert_eq!(unit.owner, f.alice);
+    });
+    assert_eq!(f.client.get_unit(&unit_id).unwrap().transfer_count, 0);
+}
+
+#[test]
+fn test_recall_severity_tiers() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    for severity in 1..=3 {
+        let batch_id = f.hash_str(&std::format!("BATCH-RECALL-{severity}"));
+        let notice = f.hash_str(&std::format!("REGULATORY-NOTICE-{severity}"));
+        let (root, units) = f.build_sample_batch(2);
+        f.client
+            .commit_batch(&f.brand, &batch_id, &root, &12, &root, &2, &None, &None);
+        let unit_id = f.client.activate(
+            &f.brand,
+            &batch_id,
+            &units[0].0,
+            &units[0].3,
+            &units[0].1,
+            &f.alice,
+        );
+        assert!(f
+            .client
+            .get_batch_recall_info(&f.brand, &batch_id)
+            .is_none());
+
+        for invalid in [0, 4, 255, u32::MAX] {
+            assert_eq!(
+                f.client
+                    .try_recall_batch(&f.brand, &batch_id, &invalid, &notice),
+                Err(Ok(RegistryError::InvalidInput))
+            );
+            assert!(f.env.events().all().events().is_empty());
+            assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+            assert!(f
+                .client
+                .get_batch_recall_info(&f.brand, &batch_id)
+                .is_none());
+        }
+
+        let recalled_at = f.env.ledger().timestamp();
+        f.client
+            .recall_batch(&f.brand, &batch_id, &severity, &notice);
+        assert_eq!(
+            f.env.events().all(),
+            [BatchRecalled {
+                brand: f.brand.clone(),
+                batch_id: batch_id.clone(),
+                severity,
+                notice_hash: notice.clone(),
+                reason_hash: notice.clone(),
+            }
+            .to_xdr(&f.env, &f.contract_id)]
+        );
+        let expected = RecallInfo {
+            severity,
+            notice_hash: notice,
+            recalled_at,
+        };
+        assert_eq!(
+            f.client.get_batch_recall_info(&f.brand, &batch_id),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            f.env.as_contract(&f.contract_id, || {
+                f.env
+                    .storage()
+                    .persistent()
+                    .get::<_, RecallInfo>(&DataKey::BatchRecallInfo(
+                        f.brand.clone(),
+                        batch_id.clone(),
+                    ))
+            }),
+            Some(expected)
+        );
+        assert!(f.client.get_batch_recall_info(&f.bob, &batch_id).is_none());
+        assert_eq!(
+            f.client.get_unit(&unit_id).unwrap().status,
+            UnitStatus::Recalled
+        );
+        assert_eq!(
+            f.client.try_file_claim(&unit_id, &f.service_center),
+            Err(Ok(RegistryError::BatchRecalled))
+        );
+        assert_eq!(
+            f.client.try_activate(
+                &f.brand,
+                &batch_id,
+                &units[1].0,
+                &units[1].3,
+                &units[1].1,
+                &f.alice,
+            ),
+            Err(Ok(RegistryError::BatchRecalled))
+        );
+    }
+}
+
+#[test]
+fn test_recall_metadata_requires_multisig_approval() {
+    use crate::types::{BrandAction, BrandAdminConfig};
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("MULTISIG-RECALL");
+    let notice = f.hash_str("NOTICE");
+    f.client.commit_batch(
+        &f.brand,
+        &batch_id,
+        &notice,
+        &12,
+        &notice,
+        &1,
+        &None,
+        &Some(notice.clone()),
+    );
+    f.client.configure_brand_admins(
+        &f.brand,
+        &BrandAdminConfig {
+            admins: Vec::from_array(&f.env, [f.brand.clone(), f.bob.clone()]),
+            threshold: 2,
+        },
+    );
+    assert_eq!(
+        f.client.try_recall_batch(&f.brand, &batch_id, &2, &notice),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    let action = BrandAction::RecallBatch(batch_id.clone(), 2, notice.clone());
+    for severity in [0, 4, u32::MAX] {
+        assert_eq!(
+            f.client.try_propose_brand_action(
+                &f.brand,
+                &f.brand,
+                &BrandAction::RecallBatch(batch_id.clone(), severity, notice.clone())
+            ),
+            Err(Ok(RegistryError::InvalidInput))
+        );
+    }
+    let proposal = f.client.propose_brand_action(&f.brand, &f.brand, &action);
+    assert!(!f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+    assert!(f
+        .client
+        .get_batch_recall_info(&f.brand, &batch_id)
+        .is_none());
+    assert_eq!(
+        f.client
+            .try_approve_brand_action(&f.alice, &f.brand, &proposal),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+    f.env.ledger().with_mut(|li| li.timestamp += 10);
+    let recalled_at = f.env.ledger().timestamp();
+    assert!(f.client.approve_brand_action(&f.bob, &f.brand, &proposal));
+    assert!(f.client.get_batch(&f.brand, &batch_id).unwrap().recalled);
+    assert_eq!(
+        f.client
+            .get_batch(&f.brand, &batch_id)
+            .unwrap()
+            .metadata_cid,
+        Some(notice.clone())
+    );
+    assert_eq!(
+        f.client.get_batch_recall_info(&f.brand, &batch_id),
+        Some(RecallInfo {
+            severity: 2,
+            notice_hash: notice,
+            recalled_at
+        })
+    );
+    assert_eq!(
+        f.client
+            .try_approve_brand_action(&f.brand, &f.brand, &proposal),
+        Err(Ok(RegistryError::NotAuthorized))
+    );
+}
+
+#[test]
+fn test_service_center_revocation() {
+    let f = TestFixture::setup();
+    f.setup_verified_brand();
+    let batch_id = f.hash_str("BATCH-REVOKE");
+    let (root, units) = f.build_sample_batch(1);
+    f.client
+        .commit_batch(&f.brand, &batch_id, &root, &12, &root, &1, &None, &None);
+    let unit_id = f.client.activate(
+        &f.brand,
+        &batch_id,
+        &units[0].0,
+        &units[0].3,
+        &units[0].1,
+        &f.alice,
+    );
+    let claim_id = f.client.file_claim(&unit_id, &f.service_center);
+    let before = f.client.get_unit(&unit_id).unwrap();
+    f.client.revoke_service_center(&f.brand, &f.service_center);
+    assert_eq!(
+        f.env.events().all(),
+        [
+            ServiceCenterRevoked {
+                brand: f.brand.clone(),
+                service_center: f.service_center.clone()
+            }
+            .to_xdr(&f.env, &f.contract_id),
+            ServiceCenterRegistered {
+                brand: f.brand.clone(),
+                service_center: f.service_center.clone(),
+                authorized: false,
+            }
+            .to_xdr(&f.env, &f.contract_id),
+        ]
+    );
+    assert!(!f.client.is_service_center(&f.brand, &f.service_center));
+    assert_eq!(
+        f.client.get_service_center(&f.brand, &f.service_center),
+        Some(ServiceCenter {
+            tier: 3,
+            active: false
+        })
+    );
+    assert_eq!(
+        f.client.try_file_claim(&unit_id, &f.service_center),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    assert_eq!(
+        f.client
+            .try_resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Replaced, &root),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    assert_eq!(
+        f.client.get_claim(&unit_id, &claim_id).unwrap().outcome,
+        ClaimOutcome::Pending
+    );
+    assert_eq!(f.client.get_unit(&unit_id).unwrap(), before);
+
+    // Accreditation changes cannot silently restore a revoked authorization.
+    f.client
+        .update_service_center_tier(&f.brand, &f.service_center, &2);
+    assert_eq!(
+        f.env.events().all(),
+        [ServiceCenterTierUpdated {
+            brand: f.brand.clone(),
+            service_center: f.service_center.clone(),
+            new_tier: 2,
+        }
+        .to_xdr(&f.env, &f.contract_id)]
+    );
+    assert_eq!(
+        f.client.try_file_claim(&unit_id, &f.service_center),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+    assert_eq!(
+        f.client
+            .try_resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Repaired, &root),
+        Err(Ok(RegistryError::ServiceCenterNotAuthorized))
+    );
+
+    f.client
+        .register_service_center(&f.brand, &f.service_center);
+    assert_eq!(
+        f.client.get_service_center(&f.brand, &f.service_center),
+        Some(ServiceCenter {
+            tier: 2,
+            active: true
+        })
+    );
+    f.client
+        .resolve_claim(&unit_id, &claim_id, &ClaimOutcome::Repaired, &root);
+    assert_eq!(
+        f.client.get_claim(&unit_id, &claim_id).unwrap().outcome,
+        ClaimOutcome::Repaired
+    );
+    assert_eq!(f.client.file_claim(&unit_id, &f.service_center), 2);
 }

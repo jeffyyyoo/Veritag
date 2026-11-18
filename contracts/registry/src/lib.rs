@@ -8,16 +8,17 @@ pub mod types;
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
 use crate::events::{
-    BatchCommitted, BatchFrozen, BatchRecalled, BatchUnfrozen, BrandActionExecuted,
-    BrandActionProposed, BrandRegistered, BrandVerified, ClaimFiled, ClaimResolved,
-    DuplicateAttempt, ServiceCenterRegistered, TransferCancelled, TransferOffered, UnitActivated,
-    UnitFlagged, UnitRetired, UnitTransferred, WarrantyExtended,
+    BatchCommitted, BatchFrozen, BatchRecalled, BatchTransferLimitUpdated, BatchUnfrozen,
+    BrandActionExecuted, BrandActionProposed, BrandRegistered, BrandVerified, ClaimFiled,
+    ClaimResolved, DuplicateAttempt, ServiceCenterRegistered, ServiceCenterRevoked,
+    ServiceCenterTierUpdated, TransferCancelled, TransferOffered, UnitActivated, UnitFlagged,
+    UnitRetired, UnitTransferred, WarrantyExtended,
 };
 use crate::types::{
     Batch, BatchStatus, Brand, BrandAction, BrandActionProposal, BrandAdminConfig, Claim,
-    ClaimOutcome, Config, RecallInfo, RegistryError, TransferOffer, Unit, UnitRetirement,
-    UnitStatus, UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
-    MAX_WARRANTY_MONTHS, SECONDS_PER_MONTH,
+    ClaimOutcome, Config, RecallInfo, RegistryError, ServiceCenter, TransferOffer, Unit,
+    UnitRetirement, UnitStatus, UnitView, VerifyResult, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
+    MAX_WARRANTY_MONTHS, SECONDS_PER_MONTH, TRANSFER_COOLDOWN_SECONDS,
 };
 
 const MAX_DOMAIN_LEN: u32 = 253;
@@ -1179,6 +1180,20 @@ impl VeritagRegistry {
         Ok(record)
     }
 
+    fn require_service_center_tier(
+        env: &Env,
+        brand: &Address,
+        service_center: &Address,
+        required_tier: u32,
+    ) -> Result<(), RegistryError> {
+        let record = storage::get_service_center(env, brand, service_center)
+            .ok_or(RegistryError::ServiceCenterNotAuthorized)?;
+        if !record.active || !(required_tier..=3).contains(&record.tier) {
+            return Err(RegistryError::ServiceCenterNotAuthorized);
+        }
+        Ok(())
+    }
+
     fn ensure_unit_operational(env: &Env, unit: &Unit) -> Result<Batch, RegistryError> {
         Self::ensure_unit_not_retired(unit)?;
         let batch = storage::get_batch(env, &unit.brand, &unit.batch_id)
@@ -1311,7 +1326,10 @@ impl VeritagRegistry {
                     return Err(RegistryError::BatchRecalled);
                 }
             }
-            BrandAction::RecallBatch(batch_id, _) => {
+            BrandAction::RecallBatch(batch_id, severity, _) => {
+                if !(1..=3).contains(severity) {
+                    return Err(RegistryError::InvalidInput);
+                }
                 storage::get_batch(env, brand, batch_id).ok_or(RegistryError::BatchNotFound)?;
             }
             BrandAction::RegisterServiceCenter(_) if !record.verified => {
@@ -1351,12 +1369,15 @@ impl VeritagRegistry {
             BrandAction::UnfreezeBatch(batch_id) => {
                 Self::set_batch_frozen_internal(env, brand.clone(), batch_id.clone(), false)?
             }
-            BrandAction::RecallBatch(batch_id, reason_hash) => Self::recall_batch_internal(
-                env,
-                brand.clone(),
-                batch_id.clone(),
-                reason_hash.clone(),
-            )?,
+            BrandAction::RecallBatch(batch_id, severity, notice_hash) => {
+                Self::recall_batch_internal(
+                    env,
+                    brand.clone(),
+                    batch_id.clone(),
+                    *severity,
+                    notice_hash.clone(),
+                )?
+            }
             BrandAction::RegisterServiceCenter(center) => {
                 Self::register_service_center_internal(env, brand.clone(), center.clone())?
             }

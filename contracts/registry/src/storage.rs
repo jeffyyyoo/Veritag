@@ -4,7 +4,7 @@ use soroban_sdk::{
 
 use crate::types::{
     Batch, BatchStatus, Brand, BrandActionProposal, BrandAdminConfig, Claim, Config, RecallInfo,
-    TransferOffer, Unit, UnitRetirement, SECONDS_PER_MONTH,
+    ServiceCenter, TransferOffer, Unit, UnitRetirement, SECONDS_PER_MONTH,
 };
 
 /// Storage layout used before optional expiration was introduced.
@@ -249,6 +249,10 @@ pub fn get_batch(env: &Env, brand: &Address, batch_id: &BytesN<32>) -> Option<Ba
         .get(&DataKey::Batch(brand.clone(), batch_id.clone()))?;
     // Independently merged batch features may be absent from older stored records.
     let mut fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid batch storage");
+    let transfer_limit_key = Symbol::new(env, "max_transfers");
+    if !fields.contains_key(transfer_limit_key.clone()) {
+        fields.set(transfer_limit_key, None::<u32>.into_val(env));
+    }
     let metadata_key = Symbol::new(env, "metadata_cid");
     if !fields.contains_key(metadata_key.clone()) {
         fields.set(metadata_key, None::<BytesN<32>>.into_val(env));
@@ -325,6 +329,10 @@ pub fn get_unit(env: &Env, unit_id: &BytesN<32>) -> Option<Unit> {
         .persistent()
         .get(&DataKey::Unit(unit_id.clone()))?;
     let mut fields = Map::<Symbol, Val>::try_from_val(env, &value).expect("invalid unit storage");
+    let transfer_count_key = Symbol::new(env, "transfer_count");
+    if !fields.contains_key(transfer_count_key.clone()) {
+        fields.set(transfer_count_key, 0u32.into_val(env));
+    }
     let timestamp_key = Symbol::new(env, "last_transferred_at");
     if !fields.contains_key(timestamp_key.clone()) {
         fields.set(timestamp_key, 0u64.into_val(env));
