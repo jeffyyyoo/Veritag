@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    merkle::{compute_leaf, hash_pair, sha256_bytes, MAX_PROOF_DEPTH},
+    merkle::{compute_leaf, hash_pair, sha256_bytes, verify_proof, MAX_PROOF_DEPTH},
     storage::DataKey,
     types::{
         ClaimOutcome, RegistryError, UnitStatus, VerifyStatus, DEFAULT_MAX_CLAIMS_PER_UNIT,
@@ -1184,4 +1184,149 @@ fn test_merged_legacy_brand_governance() {
     assert!(!f.client.is_service_center(&f.brand, &f.service_center));
     assert!(f.client.approve_brand_action(&f.alice, &f.brand, &proposal));
     assert!(f.client.is_service_center(&f.brand, &f.service_center));
+}
+
+// Preserve the implementation before optimization for correctness and budget comparisons.
+fn merkle_baseline_hash_pair(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
+    let a_arr = a.to_array();
+    let b_arr = b.to_array();
+    let mut buf = [0u8; 64];
+    if a_arr <= b_arr {
+        buf[..32].copy_from_slice(&a_arr);
+        buf[32..].copy_from_slice(&b_arr);
+    } else {
+        buf[..32].copy_from_slice(&b_arr);
+        buf[32..].copy_from_slice(&a_arr);
+    }
+    let bytes = Bytes::from_array(env, &buf);
+    sha256_bytes(env, &bytes)
+}
+
+fn merkle_baseline_verify(
+    env: &Env,
+    root: &BytesN<32>,
+    leaf: &BytesN<32>,
+    proof: &Vec<BytesN<32>>,
+) -> bool {
+    if proof.len() > MAX_PROOF_DEPTH {
+        return false;
+    }
+    let mut computed = leaf.clone();
+    for sibling in proof.iter() {
+        computed = merkle_baseline_hash_pair(env, &computed, &sibling);
+    }
+    computed == *root
+}
+
+fn merkle_depth_fixture(env: &Env, depth: u32) -> (BytesN<32>, BytesN<32>, Vec<BytesN<32>>) {
+    let leaf = BytesN::from_array(env, &[42u8; 32]);
+    let mut root = leaf.clone();
+    let mut proof = Vec::new(env);
+    for i in 0..depth {
+        let sibling = sha256_bytes(env, &Bytes::from_array(env, &i.to_be_bytes()));
+        root = merkle_baseline_hash_pair(env, &root, &sibling);
+        proof.push_back(sibling);
+    }
+    (root, leaf, proof)
+}
+
+#[test]
+fn test_merkle_proof_depth_and_invalid_inputs() {
+    let env = Env::default();
+    env.cost_estimate().budget().reset_unlimited();
+    let wrong_hash = BytesN::from_array(&env, &[255; 32]);
+    let leaf = BytesN::from_array(&env, &[42; 32]);
+    let empty = Vec::new(&env);
+    assert!(verify_proof(&env, &leaf, &leaf, &empty));
+    assert!(!verify_proof(&env, &wrong_hash, &leaf, &empty));
+    for depth in 1..=MAX_PROOF_DEPTH {
+        let (root, leaf, proof) = merkle_depth_fixture(&env, depth);
+        assert!(merkle_baseline_verify(&env, &root, &leaf, &proof));
+        assert!(verify_proof(&env, &root, &leaf, &proof));
+        assert!(!verify_proof(&env, &wrong_hash, &leaf, &proof));
+        assert!(!verify_proof(&env, &root, &wrong_hash, &proof));
+        let mut invalid = proof.clone();
+        invalid.set(depth / 2, wrong_hash.clone());
+        assert!(!verify_proof(&env, &root, &leaf, &invalid));
+    }
+    let (root, leaf, proof) = merkle_depth_fixture(&env, MAX_PROOF_DEPTH + 1);
+    assert!(!verify_proof(&env, &root, &leaf, &proof));
+}
+
+#[test]
+fn test_merkle_odd_and_even_trees() {
+    let f = TestFixture::setup();
+    f.env.cost_estimate().budget().reset_unlimited();
+    for count in [1, 2, 3, 5, 7, 8] {
+        let (root, units) = f.build_sample_batch(count);
+        for (serial, _, secret_hash, proof) in units {
+            let leaf = compute_leaf(&f.env, &serial, &secret_hash);
+            assert!(verify_proof(&f.env, &root, &leaf, &proof));
+            assert!(merkle_baseline_verify(&f.env, &root, &leaf, &proof));
+        }
+    }
+}
+
+#[test]
+fn test_merkle_pair_ordering_and_equal_nodes() {
+    let env = Env::default();
+    let a = BytesN::from_array(&env, &[1; 32]);
+    let b = BytesN::from_array(&env, &[2; 32]);
+    assert_eq!(
+        hash_pair(&env, &a, &b),
+        merkle_baseline_hash_pair(&env, &a, &b)
+    );
+    assert_eq!(hash_pair(&env, &a, &b), hash_pair(&env, &b, &a));
+    assert_eq!(
+        hash_pair(&env, &a, &a),
+        merkle_baseline_hash_pair(&env, &a, &a)
+    );
+    let mut prefix = [128; 32];
+    prefix[31] = 127;
+    let low = BytesN::from_array(&env, &prefix);
+    prefix[31] = 129;
+    let high = BytesN::from_array(&env, &prefix);
+    assert_eq!(
+        hash_pair(&env, &low, &high),
+        merkle_baseline_hash_pair(&env, &low, &high)
+    );
+    assert_eq!(hash_pair(&env, &low, &high), hash_pair(&env, &high, &low));
+    let root = hash_pair(&env, &a, &b);
+    assert!(verify_proof(
+        &env,
+        &root,
+        &a,
+        &soroban_sdk::vec![&env, b.clone()]
+    ));
+    assert!(verify_proof(&env, &root, &b, &soroban_sdk::vec![&env, a]));
+}
+
+#[test]
+fn test_merkle_budget_by_depth() {
+    for depth in [8, 16, 24] {
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let (root, leaf, proof) = merkle_depth_fixture(&env, depth);
+        // Exclude fixture construction from both measurements.
+        env.cost_estimate().budget().reset_unlimited();
+        let baseline_valid = merkle_baseline_verify(&env, &root, &leaf, &proof);
+        let baseline_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+        let baseline_mem = env.cost_estimate().budget().memory_bytes_cost();
+        std::println!("Merkle depth {depth} baseline: CPU {baseline_cpu}, memory {baseline_mem}");
+        env.cost_estimate().budget().print();
+        env.cost_estimate().budget().reset_unlimited();
+        let optimized_valid = verify_proof(&env, &root, &leaf, &proof);
+        let optimized_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+        let optimized_mem = env.cost_estimate().budget().memory_bytes_cost();
+        std::println!(
+            "Merkle depth {depth} optimized: CPU {optimized_cpu}, memory {optimized_mem}"
+        );
+        env.cost_estimate().budget().print();
+        assert!(baseline_valid && optimized_valid);
+        assert!(
+            optimized_cpu < baseline_cpu,
+            "CPU savings regressed at depth {depth}"
+        );
+        assert!(optimized_mem <= baseline_mem);
+    }
 }
